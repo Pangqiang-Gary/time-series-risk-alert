@@ -23,7 +23,7 @@ class ModelConfig:
 
     
     pooling: str = "last"   # "last" or "mean"
-    out_activation: str = "sigmoid"  # "sigmoid" or "none"
+    out_activation: str = "none"  # "sigmoid" or "none"
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -90,8 +90,11 @@ class TimeSeriesTransformerRegressor(nn.Module):
 
         if cfg.out_activation == "sigmoid":
             self.out_act = nn.Sigmoid()
-        else:
+        elif cfg.out_activation in ("none", "identity", None, ""):
             self.out_act = nn.Identity()
+        else:
+            raise ValueError(f"Unknown out_activation: {cfg.out_activation}")
+
 
         self.dropout = nn.Dropout(cfg.dropout)
 

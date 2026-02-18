@@ -140,21 +140,28 @@ def main():
     X_all, end_dates = make_windows(df_scaled, feature_cols, seq_len)
     X_tensor = torch.from_numpy(X_all).to(device)  # (N, T, D)
 
-    # 5) Load model + predict
+    # 5) Load model + predict (logits -> sigmoid -> probability)
     model = TimeSeriesTransformerRegressor(model_cfg).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
     with torch.no_grad():
-        # batch prediction (avoid huge memory if needed)
         bs = 512
         preds = []
         for i in range(0, X_tensor.size(0), bs):
-            y_hat = model(X_tensor[i:i+bs])  # (b,1)
-            preds.append(y_hat.squeeze(1).detach().cpu().numpy())
-        preds = np.concatenate(preds, axis=0)
+            logits = model(X_tensor[i:i+bs])     # (b, 1) raw logits
+            prob = torch.sigmoid(logits)         # (b, 1) -> [0, 1]
+            preds.append(prob.squeeze(1).cpu().numpy())
 
-    pred_series = pd.Series(preds, index=pd.to_datetime(end_dates), name="pred_sell_score")
+    preds = np.concatenate(preds, axis=0)
+
+# Final risk probability series (0~1)
+    pred_series = pd.Series(
+        preds,
+        index=pd.to_datetime(end_dates),
+        name="pred_prob"
+    )
+
 
     # 6) Choose threshold using TRAIN predictions (more principled than guessing)
     train_pred = pred_series.loc[pred_series.index <= pd.to_datetime(split_cfg.train_end)]
@@ -189,7 +196,7 @@ def main():
     save_path.parent.mkdir(parents=True, exist_ok=True)
 
     add_plots = []
-    add_plots.append(mpf.make_addplot(score_plot, panel=1, ylabel="pred sell_score", secondary_y=False))
+    add_plots.append(mpf.make_addplot(score_plot, panel=1, ylabel="pred_prob", secondary_y=False))
     add_plots.append(mpf.make_addplot(pd.Series(thr, index=score_plot.index), panel=1))
 
     # Use a Yahoo-like style

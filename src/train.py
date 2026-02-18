@@ -25,27 +25,80 @@ def set_seed(seed: int = 42) -> None:
 
 
 @torch.no_grad()
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict[str, float]:
+def evaluate(model, loader, device, thr=0.5, debug_prob=False):
+    pos60 = pos70 = pos80 = 0
+
     model.eval()
-    mse = 0.0
-    mae = 0.0
-    n = 0
+    correct = 0
+    total = 0
+
+    tp = fp = fn = 0    #calculate matrix trur pos,fal pos,fal neg
+    pred_pos = 0
+    true_pos = 0
+
+    prob_min = float("inf")
+    prob_max = float("-inf")
+    prob_sum = 0.0
+    prob_cnt = 0    #Debug
 
     for X, y in loader:
-        X = X.to(device)  # (B, T, D)
-        y = y.to(device)  # (B, 1)
+        X = X.to(device)    #(B,T,D)
+        y = y.to(device)    #(B, )
 
-        y_hat = model(X)  # (B, 1)
-        err = y_hat - y
+        logits = model(X)
+        prob = torch.sigmoid(logits)
+        pred = (prob >= thr).float()
 
-        mse += float((err ** 2).sum().item()) #Sum of Squared Errors
-        mae += float(err.abs().sum().item())#sum of absolute errors
-        n += y.numel()#number of samples
+        if debug_prob:
+            prob_min = min(prob_min, prob.min().item())
+            prob_max = max(prob_max, prob.max().item())
+            prob_sum += prob.sum().item()
+            prob_cnt += prob.numel()
 
-    mse /= max(n, 1)
-    mae /= max(n, 1)
-    rmse = float(np.sqrt(mse))
-    return {"mse": mse, "rmse": rmse, "mae": mae}
+            pos60 += (prob >= 0.60).sum().item() # the number of postive in different thr
+            pos70 += (prob >= 0.70).sum().item()
+            pos80 += (prob >= 0.80).sum().item()
+
+        correct += (pred == y).sum().item()
+        total += y.numel()
+
+        pred_pos += pred.sum().item()
+        true_pos += y.sum().item()
+
+        tp += ((pred == 1) & (y == 1)).sum().item()
+        fp += ((pred == 1) & (y == 0)).sum().item()
+        fn += ((pred == 0) & (y == 1)).sum().item()
+
+    acc = correct / max(total, 1)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+    pred_pos_rate = pred_pos / max(total, 1)
+    true_pos_rate = true_pos / max(total, 1)
+
+    out = {
+        "acc": float(acc),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "pred_pos_rate": float(pred_pos_rate),
+        "true_pos_rate": float(true_pos_rate),
+    }
+
+    if debug_prob and prob_cnt > 0:
+        out["prob_min"] = prob_min
+        out["prob_max"] = prob_max
+        out["prob_mean"] = prob_sum / prob_cnt
+        out["pos_rate@0.60"] = pos60 / prob_cnt
+        out["pos_rate@0.70"] = pos70 / prob_cnt
+        out["pos_rate@0.80"] = pos80 / prob_cnt
+        print("Prob stats:", {"min": out["prob_min"], "max": out["prob_max"], "mean": out["prob_mean"]})
+        print("Pos rate @ thr:", {"0.60": out["pos_rate@0.60"], "0.70": out["pos_rate@0.70"], "0.80": out["pos_rate@0.80"]})
+
+    return out
+
+
+
 
 
 def train_one_epoch(
@@ -88,14 +141,14 @@ def train_one_epoch(
 # ---------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", type=str, default=str(Path("..") / "data" / "sp500_dataset.csv"))
+    parser.add_argument("--dataset", type=str, default=str(Path("data") / "sp500_dataset.csv"))
     parser.add_argument("--seq_len", type=int, default=60)
     parser.add_argument("--train_end", type=str, default="2017-12-31")
     parser.add_argument("--val_end", type=str, default="2021-12-31")
 
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2) #L2
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -106,11 +159,11 @@ def main():
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean"])
 
-    parser.add_argument("--loss", type=str, default="huber", choices=["mse", "huber"])
+   #parser.add_argument("--loss", type=str, default="huber", choices=["mse", "huber"])
     parser.add_argument("--patience", type=int, default=6)  #early stopping tolerant round
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--save_dir", type=str, default=str(Path("..") / "checkpoints"))
+    parser.add_argument("--save_dir", type=str, default=str(Path("checkpoints")))
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -145,26 +198,24 @@ def main():
         dim_feedforward=args.dim_ff,
         dropout=args.dropout,
         pooling=args.pooling,
-        out_activation="sigmoid",
+        out_activation="none",
     )
     model = TimeSeriesTransformerRegressor(model_cfg).to(device)
 
     # 4) Loss function
-    if args.loss == "mse":
-        loss_fn = nn.MSELoss()
-    else:
-        # Huber is often more robust to noisy labels/outliers
-        loss_fn = nn.HuberLoss(delta=0.5)
+    loss_fn = nn.BCEWithLogitsLoss()
+
+
 
     # 5) Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay) #L2
 
-    # 6) Train with early stopping on val RMSE
+    # 6) Train with early stopping on val f1
     save_dir = Path(args.save_dir).resolve()
     save_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = save_dir / "best_model.pt"
 
-    best_val_rmse = float("inf")
+    best_val_f1 = -float("inf")
     bad_epochs = 0
 
     print("\nTraining start...")
@@ -182,18 +233,33 @@ def main():
             grad_clip=args.grad_clip,
         )
 
-        val_metrics = evaluate(model, val_loader, device)
-        val_rmse = val_metrics["rmse"]
+        # ---- choose best threshold on VAL (maximize F1) ----
+        thr = 0.4
+        val_metrics = evaluate(model, val_loader, device, thr=thr)
+        val_f1 = val_metrics["f1"]
+
+
+
+# ----------------------------------------------------
+
 
         print(
-            f"Epoch {epoch:03d} | "
-            f"train_loss={train_loss:.6f} | "
-            f"val_rmse={val_rmse:.6f} val_mae={val_metrics['mae']:.6f}"
-        )
+    f"Epoch {epoch:03d} | train_loss={train_loss:.6f} | thr={thr:.2f} | "
+    f"val_acc={val_metrics['acc']:.6f} "
+    f"val_prec={val_metrics['precision']:.6f} "
+    f"val_rec={val_metrics['recall']:.6f} "
+    f"val_f1={val_metrics['f1']:.6f} "
+    f"pred_pos={val_metrics['pred_pos_rate']:.3f} "
+    f"true_pos={val_metrics['true_pos_rate']:.3f}"
+)
+
+
+
 
         # Early stopping
-        if val_rmse < best_val_rmse - 1e-6:
-            best_val_rmse = val_rmse
+        # Early stopping (classification: higher f1 is better)
+        if val_f1 > best_val_f1 + 1e-6:
+            best_val_f1 = val_f1
             bad_epochs = 0
             torch.save(
                 {
@@ -204,7 +270,7 @@ def main():
                 },
                 ckpt_path,
             )
-            print(f"  -> Saved best model (val_rmse={best_val_rmse:.6f})")
+            print(f"  -> Saved best model (val_f1={best_val_f1:.6f})")
         else:
             bad_epochs += 1
             if bad_epochs >= args.patience:
@@ -216,8 +282,15 @@ def main():
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
 
-    test_metrics = evaluate(model, test_loader, device)
+    # Re-tune threshold on VAL using the best checkpoint
+    test_thr = 0.4
+    print(f"[DEBUG] Using test threshold = {test_thr:.2f}")
+    test_metrics = evaluate(model, test_loader, device, thr=test_thr, debug_prob=True)
+
+
     print("Test metrics:", test_metrics)
+    
+
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ class SplitConfig:
     train_end: str = "2017-12-31"      # inclusive
     val_end: str = "2021-12-31"        # inclusive
     test_end: str = "2099-12-31"       # inclusive, effectively "rest"
-    target_col: str = "sell_score"
+    target_col: str = "label"
     date_col: str = "Date"
     drop_cols: Tuple[str, ...] = ("worst_ret_H", "max_dd_H")
   # keep or drop
@@ -86,6 +86,8 @@ class TimeSeriesWindowDataset(Dataset):
         # Extract arrays
         x = df[feature_cols].to_numpy(dtype=np.float32) # x(N,D)
         y = df[target_col].to_numpy(dtype=np.float32)# Y(N,)
+        if target_col == "label":
+            y = (y > 0).astype(np.float32)
 
         # Scale features if requested
         self.apply_scaling = apply_scaling
@@ -137,8 +139,10 @@ def load_datasets(
         if c in df.columns:
             df = df.drop(columns=[c])
 
-    # Identify feature columns: all numeric columns except target
-    feature_cols = [c for c in df.columns if c != cfg.target_col]
+    # Identify feature columns: exclude target and any non-causal columns (to avoid leakage)
+    exclude_cols = {cfg.target_col, "sell_score"}
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
+
     
 
     # Split by time
