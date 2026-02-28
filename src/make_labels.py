@@ -9,11 +9,11 @@ FEAT_PATH = DATA_DIR / "sp500_features.csv"
 OUT_PATH = DATA_DIR / "sp500_dataset.csv"
 
 # ====== hyperparameters ======
-H = 15          # see in 15 days in future
+H = 10         # see in 5 days in future
 LOW_WIN = 20    # low point in windows
 
-DD_TH = -0.08   # drawdown threshold, e.g. -8%
-EW = 10        # early-warning window length (days before event)
+DD_TH = -0.05   # drawdown threshold, e.g. -8%
+EW = 1        # early-warning window length (days before event)
 
 
 def make_sell_score(df: pd.DataFrame) -> pd.DataFrame:

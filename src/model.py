@@ -98,32 +98,37 @@ class TimeSeriesTransformerRegressor(nn.Module):
 
         self.dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        return_embedding: bool = False,
+    ) -> torch.Tensor:
         """
-        x: (B, T, D)
-        """
-        # 1) Feature projection
+    x: (B, T, D)
+    return:
+      - logits: (B, 1)
+      - if return_embedding=True: (logits, h) where h: (B, d_model)
+    """
         x = self.input_proj(x)           # (B, T, d_model)
         x = self.dropout(x)
 
-        # 2) Add positional encoding (time step info)
         x = self.pos_enc(x)              # (B, T, d_model)
-
-        # 3) Encode sequence: let each time step attend to all other time steps
         z = self.encoder(x, mask=attn_mask)  # (B, T, d_model)
 
-        # 4) Pooling: get a single vector for regression
         if self.cfg.pooling == "last":
-            h = z[:, -1, :]              # (B, d_model) use last time step
+            h = z[:, -1, :]              # (B, d_model)
         elif self.cfg.pooling == "mean":
-            h = z.mean(dim=1)            # (B, d_model) average over time
+            h = z.mean(dim=1)            # (B, d_model)
         else:
             raise ValueError(f"Unknown pooling: {self.cfg.pooling}")
 
-        # 5) Regression head
-        y_hat = self.head(h)             # (B, 1)
-        y_hat = self.out_act(y_hat)      # (B, 1) optionally in [0,1]
-        return y_hat
+        logits = self.head(h)            # (B, 1)
+        logits = self.out_act(logits)    # Identity in your training (out_activation="none")
+
+        if return_embedding:
+            return logits, h
+        return logits
 
 
 if __name__ == "__main__":
