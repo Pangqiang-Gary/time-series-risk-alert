@@ -13,22 +13,21 @@ try:
 except ImportError:  # pragma: no cover
     raise ImportError("Please install PyTorch first: pip install torch")
 
-LOSS_COL = "loss_weight"
-
 
 @dataclass
 class SplitConfig:
-    seq_len: int = 60
-    train_end: str = "2017-12-31"
-    val_end: str = "2021-12-31"
-    test_end: str = "2099-12-31"
+    """Defines how to split the data into train / val / test sets."""
+    seq_len: int = 10              # number of past days per sample window
+    train_end: str = "2017-12-31"  # training data ends here (2000-2017)
+    val_end: str = "2021-12-31"    # validation data ends here (2018-2021)
+    test_end: str = "2099-12-31"   # test data is everything after val (2022-)
     target_col: str = "label"
     date_col: str = "Date"
     ticker_col: str = "ticker_id"
-    drop_cols: Tuple[str, ...] = tuple()
 
 
 def time_split(df: pd.DataFrame, cfg: SplitConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split a single ticker's data into train/val/test by date."""
     train_df = df.loc[:cfg.train_end].copy()
     val_df = df.loc[pd.to_datetime(cfg.train_end) + pd.Timedelta(days=1): cfg.val_end].copy()
     test_df = df.loc[pd.to_datetime(cfg.val_end) + pd.Timedelta(days=1): cfg.test_end].copy()
@@ -36,6 +35,7 @@ def time_split(df: pd.DataFrame, cfg: SplitConfig) -> Tuple[pd.DataFrame, pd.Dat
 
 
 def time_split_multi(df: pd.DataFrame, cfg: SplitConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split data for multiple tickers independently, then concatenate."""
     train_parts, val_parts, test_parts = [], [], []
     for _, sub in df.groupby(cfg.ticker_col):
         sub = sub.sort_index()
@@ -54,17 +54,28 @@ def time_split_multi(df: pd.DataFrame, cfg: SplitConfig) -> Tuple[pd.DataFrame, 
 
 
 def zscore_fit(train_x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute mean and std from training data (used to normalize all splits)."""
     mean = train_x.mean(axis=0)
     std = train_x.std(axis=0)
-    std = np.where(std < 1e-12, 1.0, std)
+    std = np.where(std < 1e-12, 1.0, std)  # avoid division by zero
     return mean, std
 
 
 def zscore_transform(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Apply z-score normalization using pre-computed mean and std."""
     return (x - mean) / std
 
 
 class TimeSeriesWindowDataset(Dataset):
+    """
+    PyTorch Dataset that produces sliding windows of historical features.
+
+    Each sample is:
+      x: (seq_len, num_features) — the past seq_len days of features
+      y: scalar label (1 = alert, 0 = normal)
+
+    Windows are built per-ticker so data from different assets never overlap.
+    """
     def __init__(
         self,
         df: pd.DataFrame,
@@ -85,17 +96,19 @@ class TimeSeriesWindowDataset(Dataset):
         self.feature_cols = feature_cols
         self.target_col = target_col
         self.ticker_col = ticker_col
-        self.loss_col = LOSS_COL
 
+        # Sort rows by ticker then date so windows are contiguous
         df_sorted = df.reset_index().sort_values([ticker_col, date_col])
         self.row_tickers = df_sorted[ticker_col].to_numpy(dtype=np.int64)
-        self.row_weights = df_sorted[self.loss_col].to_numpy(dtype=np.float32)
         self.row_dates = pd.to_datetime(df_sorted[date_col]).to_numpy(dtype="datetime64[ns]")
         price_arr = df_sorted[feature_cols].to_numpy(dtype=np.float32)
         label_arr = df_sorted[target_col].to_numpy(dtype=np.float32)
+
+        # Convert label: anything > 0 is positive (1), rest is 0
         if target_col == "label":
             label_arr = (label_arr > 0).astype(np.float32)
 
+        # Apply z-score scaling if requested
         if apply_scaling:
             if scaler_mean is None or scaler_std is None:
                 raise ValueError("Scaling is enabled but scaler_mean/std not provided.")
@@ -104,19 +117,22 @@ class TimeSeriesWindowDataset(Dataset):
         self.x = price_arr
         self.row_labels = label_arr
 
+        # Find where one ticker ends and the next begins
+        # Windows must not cross ticker boundaries
         ticker_changes = np.where(np.diff(self.row_tickers) != 0)[0] + 1
         bounds = np.concatenate(([0], ticker_changes, [len(self.row_tickers)]))
         indices: List[int] = []
         for start, end in zip(bounds[:-1], bounds[1:]):
             if end - start < seq_len:
-                continue
+                continue  # not enough rows for even one window
+            # index points to the LAST row of each window (today)
             indices.extend(range(start + seq_len - 1, end))
         if not indices:
             raise ValueError("Not enough rows to build any sequence windows")
 
         self.indices = np.array(indices, dtype=np.int64)
+        # Store metadata for each window
         self.window_tickers = self.row_tickers[self.indices].astype(np.int64)
-        self.window_weights = self.row_weights[self.indices].astype(np.float32)
         self.window_labels = self.row_labels[self.indices].astype(np.float32)
         self.window_dates = self.row_dates[self.indices]
 
@@ -124,39 +140,93 @@ class TimeSeriesWindowDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx: int):
+        # Return the window ending at index t: rows [t-seq_len+1, ..., t]
         t = self.indices[idx]
-        start = t - self.seq_len + 1
-        x_win = self.x[start: t + 1]
+        x_win = self.x[t - self.seq_len + 1: t + 1]   # (seq_len, D)
         y_t = self.window_labels[idx]
-        w_t = self.window_weights[idx]
-
-        X = torch.from_numpy(x_win)
-        y = torch.tensor([y_t], dtype=torch.float32)
-        w = torch.tensor([w_t], dtype=torch.float32)
-        return X, y, w
+        return torch.from_numpy(x_win), torch.tensor([y_t], dtype=torch.float32)
 
     def ticker_counts(self) -> Dict[int, int]:
+        """How many windows belong to each ticker."""
         unique, counts = np.unique(self.window_tickers, return_counts=True)
         return {int(k): int(v) for k, v in zip(unique, counts)}
 
 
 LABEL_MODES = {"baseline", "event_day_only", "event_day_plus_prev1"}
-FEATURE_MODES = {"baseline", "spreads", "relation"}
+
+# Columns that are raw prices — never used as model features
+RAW_PRICE_COLS = {"Open", "High", "Low", "Close", "Adj Close", "Volume"}
+
+# Feature sets organized by engineering stage (used for ablation experiments)
+STAGE_FEATURES: Dict[int, List[str]] = {
+    0: [   # Basic returns, volatility, drawdown, candle shape, volume
+        "log_ret_1", "ret_5", "ret_10", "ret_20",
+        "vol_5", "vol_10", "vol_20", "vol_ratio",
+        "dd_20", "dd_60", "dd_252",
+        "body_pct", "range_pct", "upper_wick_pct", "lower_wick_pct", "is_red",
+        "vol_z_20",
+    ],
+    1: [   # Extended volatility
+        "vol_60", "vol_ratio_10_60",
+        "downside_vol_20", "upside_vol_20", "down_up_vol_ratio",
+    ],
+    2: [   # Moving averages and trend
+        "price_to_ma20", "price_to_ma60",
+        "ma_slope_20", "ma_slope_60",
+        "past_max_drawdown_20",
+    ],
+    3: [   # Technical indicators (RSI, Bollinger, ADX, MFI)
+        "rsi_14", "bollinger_pos", "adx_14", "mfi_14",
+    ],
+    4: [   # Cross-feature ratios and z-scores
+        "ret_5_over_vol_20", "drawdown_over_vol",
+        "zscore_ret_5", "zscore_vol_10",
+    ],
+    5: [   # Selected set for stage-ablation experiments
+        "vol_5", "downside_vol_20", "down_up_vol_ratio",
+        "dd_20", "dd_60", "dd_252",
+        "ret_5", "ret_10",
+        "ma_slope_60", "price_to_ma20", "past_max_drawdown_20",
+        "range_pct", "ret_skew_20", "ret_kurt_20",
+    ],
+    6: [   # Market state dynamics
+        "vol_20_slope", "consec_down_days", "drawdown_duration", "park_vol_20",
+        "dd_speed_5", "dist_to_low_252",
+    ],
+    7: [   # Day-over-day delta features
+        "vol5_change_1d", "rsi_change_1d", "dd20_change_1d",
+        "ma20_cross_today", "new_low_20_today",
+    ],
+}
 
 
-def apply_label_mode(df: pd.DataFrame, cfg: SplitConfig, label_mode: str, primary_ticker_id: int) -> pd.DataFrame:
+def get_stage_cols(stage: int) -> List[str]:
+    """Return all feature columns up to and including the given stage."""
+    cols: List[str] = []
+    for s in range(stage + 1):
+        cols.extend(STAGE_FEATURES.get(s, []))
+    return cols
+
+
+def apply_label_mode(df: pd.DataFrame, cfg: SplitConfig, label_mode: str, ticker_id: int) -> pd.DataFrame:
+    """
+    Optionally reshape labels for a single ticker.
+    - "baseline": keep original labels as-is
+    - "event_day_only": only the last positive day of each event is labeled 1
+    - "event_day_plus_prev1": last day + one day before
+    """
     if label_mode not in LABEL_MODES:
         raise ValueError(f"Unsupported label_mode={label_mode}")
     if label_mode == "baseline":
         return df
 
-    mask = df[cfg.ticker_col] == primary_ticker_id
+    mask = df[cfg.ticker_col] == ticker_id
     label = df.loc[mask, cfg.target_col].to_numpy()
     pos = label > 0
     next_pos = np.zeros_like(pos, dtype=bool)
     if len(pos) > 1:
         next_pos[:-1] = pos[1:]
-    event = pos & (~next_pos)
+    event = pos & (~next_pos)   # last day of each positive run
 
     if label_mode == "event_day_only":
         new_pos = event
@@ -172,112 +242,32 @@ def apply_label_mode(df: pd.DataFrame, cfg: SplitConfig, label_mode: str, primar
     return df
 
 
-def add_spread_features(df: pd.DataFrame, per_ticker_features: Dict[int, List[str]]) -> Tuple[pd.DataFrame, List[str]]:
-    base_feats = ["log_ret_1", "ret_5", "ret_10", "ret_20", "vol_5", "vol_10", "vol_20"]
-    ticker_ids = sorted(per_ticker_features.keys())
-    if len(ticker_ids) < 2:
-        raise ValueError("Spread features require at least two tickers")
-    new_cols: List[str] = []
-    for i in range(len(ticker_ids)):
-        for j in range(i + 1, len(ticker_ids)):
-            tid_a = ticker_ids[i]
-            tid_b = ticker_ids[j]
-            prefix = f"t{tid_a}_minus_t{tid_b}"
-            for feat in base_feats:
-                col_a = f"t{tid_a}_{feat}"
-                col_b = f"t{tid_b}_{feat}"
-                if col_a in df.columns and col_b in df.columns:
-                    new_name = f"{prefix}_{feat}"
-                    df[new_name] = df[col_a] - df[col_b]
-                    new_cols.append(new_name)
-    return df, new_cols
-
-
-def add_relation_features(df: pd.DataFrame, primary_id: int, per_ticker_features: Dict[int, List[str]]) -> Tuple[pd.DataFrame, List[str]]:
-    ticker_ids = sorted(per_ticker_features.keys())
-    if len(ticker_ids) < 2:
-        raise ValueError("Relation features require multiple tickers")
-
-    def col_name(tid: int, base: str) -> str:
-        return f"t{tid}_{base}"
-
-    new_cols: List[str] = []
-    ret_col = "log_ret_1"
-    price_col = "Adj Close"
-    vol_col = "vol_20"
-    corr_window = 20
-    beta_window = 60
-    z_window = 20
-
-    primary_ret_col = col_name(primary_id, ret_col)
-    primary_price_col = col_name(primary_id, price_col)
-    primary_vol_col = col_name(primary_id, vol_col)
-
-    if primary_ret_col not in df.columns or primary_price_col not in df.columns:
-        return df, new_cols
-
-    ret_primary = df[primary_ret_col]
-    price_primary = df[primary_price_col]
-    vol_primary = df[primary_vol_col] if primary_vol_col in df.columns else None
-
-    for tid in ticker_ids:
-        if tid == primary_id:
-            continue
-        other_ret_col = col_name(tid, ret_col)
-        other_price_col = col_name(tid, price_col)
-        other_vol_col = col_name(tid, vol_col)
-        if other_ret_col not in df.columns or other_price_col not in df.columns:
-            continue
-        ret_other = df[other_ret_col]
-
-        corr = ret_primary.rolling(corr_window, min_periods=5).corr(ret_other)
-        corr_col = f"rel_corr_{primary_id}_{tid}_{corr_window}"
-        df[corr_col] = corr.fillna(0.0)
-        new_cols.append(corr_col)
-
-        cov = ret_primary.rolling(beta_window, min_periods=10).cov(ret_other)
-        var = ret_other.rolling(beta_window, min_periods=10).var()
-        beta = cov / (var + 1e-12)
-        beta_col = f"rel_beta_{primary_id}_{tid}_{beta_window}"
-        df[beta_col] = beta.fillna(0.0)
-        new_cols.append(beta_col)
-
-        price_other = df[other_price_col]
-        ratio = np.log(price_primary / price_other.replace(0, np.nan))
-        mean = ratio.rolling(z_window, min_periods=5).mean()
-        std = ratio.rolling(z_window, min_periods=5).std().replace(0.0, 1.0)
-        zscore = (ratio - mean) / std
-        z_col = f"rel_logratio_z_{primary_id}_{tid}_{z_window}"
-        df[z_col] = zscore.fillna(0.0)
-        new_cols.append(z_col)
-
-        if vol_primary is not None and other_vol_col in df.columns:
-            vol_ratio = (vol_primary + 1e-6) / (df[other_vol_col] + 1e-6)
-            vol_col_name = f"rel_vol_ratio_{primary_id}_{tid}"
-            df[vol_col_name] = vol_ratio.fillna(0.0)
-            new_cols.append(vol_col_name)
-
-    return df, new_cols
-
-
 def load_datasets(
     dataset_csv_paths: Sequence[Path],
     cfg: SplitConfig = SplitConfig(),
-    primary_ticker_id: int = 0,
     label_mode: str = "baseline",
-    feature_mode: str = "baseline",
+    feature_stage: Optional[int] = None,
 ) -> Tuple[TimeSeriesWindowDataset, TimeSeriesWindowDataset, TimeSeriesWindowDataset, List[str]]:
+    """
+    Main entry point: load multiple ticker CSVs, normalize, split, and return datasets.
+
+    Steps:
+      1. Load each ticker CSV and find the common set of feature columns.
+      2. Stack all tickers into one dataframe.
+      3. Apply label mode shaping (optional).
+      4. Time-split into train/val/test per ticker.
+      5. Z-score normalize using training set statistics per ticker.
+      6. Build PyTorch Dataset objects with sliding windows.
+
+    Returns: (train_ds, val_ds, test_ds, feature_cols)
+    """
     if not dataset_csv_paths:
         raise ValueError("No dataset paths provided")
     if label_mode not in LABEL_MODES:
         raise ValueError(f"label_mode must be one of {LABEL_MODES}")
-    if feature_mode not in FEATURE_MODES:
-        raise ValueError(f"feature_mode must be one of {FEATURE_MODES}")
-    if not dataset_csv_paths:
-        raise ValueError("No dataset paths provided")
 
-    per_ticker_frames: Dict[int, pd.DataFrame] = {}
-    per_ticker_features: Dict[int, List[str]] = {}
+    frames: List[pd.DataFrame] = []
+    feature_sets: List[set] = []
 
     for path in dataset_csv_paths:
         path = Path(path).resolve()
@@ -287,80 +277,67 @@ def load_datasets(
         df = df.sort_values(cfg.date_col).set_index(cfg.date_col)
 
         if cfg.ticker_col not in df.columns:
-            raise ValueError(f"ticker column '{cfg.ticker_col}' missing from dataset {path}")
+            raise ValueError(f"ticker column '{cfg.ticker_col}' missing from {path}")
         ticker_ids = df[cfg.ticker_col].unique()
         if len(ticker_ids) != 1:
             raise ValueError(f"Dataset {path} must contain exactly one ticker; found {ticker_ids}")
-        ticker_id = int(ticker_ids[0])
-        if ticker_id in per_ticker_frames:
-            raise ValueError(f"Duplicate ticker id {ticker_id} across datasets.")
+        if cfg.target_col not in df.columns:
+            raise ValueError(f"target column '{cfg.target_col}' missing from {path}")
 
-        for col in cfg.drop_cols:
-            if col in df.columns:
-                df = df.drop(columns=[col])
+        # Collect feature columns (exclude raw price cols and label/ticker)
+        exclude_cols = {cfg.target_col, cfg.ticker_col} | RAW_PRICE_COLS
+        feat_cols = [c for c in df.columns if c not in exclude_cols]
+        feature_sets.append(set(feat_cols))
+        frames.append(df)
 
-        exclude_cols = {cfg.target_col, cfg.ticker_col, LOSS_COL}
-        feature_cols = [c for c in df.columns if c not in exclude_cols]
-        rename_map = {c: f"t{ticker_id}_{c}" for c in feature_cols}
-        df = df.rename(columns=rename_map)
+    # Use only features that exist in ALL ticker files
+    common_feat_set = feature_sets[0]
+    for s in feature_sets[1:]:
+        common_feat_set = common_feat_set & s
 
-        keep_cols = list(rename_map.values())
-        if ticker_id == primary_ticker_id:
-            if cfg.target_col not in df.columns:
-                raise ValueError(f"Primary dataset {path} missing target column '{cfg.target_col}'")
-            keep_cols.append(cfg.target_col)
-        per_ticker_frames[ticker_id] = df[keep_cols]
-        per_ticker_features[ticker_id] = list(rename_map.values())
+    # Optionally restrict to a specific ablation stage
+    if feature_stage is not None:
+        allowed = set(get_stage_cols(feature_stage))
+        common_feat_set = common_feat_set & allowed
 
-    if primary_ticker_id not in per_ticker_frames:
-        raise ValueError(f"Primary ticker id {primary_ticker_id} not found in provided datasets")
+    all_feature_cols = sorted(common_feat_set)
 
-    combined_df = per_ticker_frames[primary_ticker_id].copy()
-    for tid, frame in per_ticker_frames.items():
-        if tid == primary_ticker_id:
-            continue
-        combined_df = combined_df.join(frame, how="inner")
+    # Stack all tickers together
+    keep_cols = all_feature_cols + [cfg.target_col, cfg.ticker_col]
+    stacked = pd.concat([df[keep_cols] for df in frames], sort=False)
 
-    combined_df = combined_df.dropna()
-    combined_df[cfg.ticker_col] = primary_ticker_id
-    combined_df[LOSS_COL] = 1.0
-    combined_df = combined_df.sort_index()
+    # Apply label mode (optional reshaping)
+    for tid in stacked[cfg.ticker_col].unique():
+        stacked = apply_label_mode(stacked, cfg, label_mode, int(tid))
 
-    combined_df = apply_label_mode(combined_df, cfg, label_mode, primary_ticker_id)
-
-    all_feature_cols: List[str] = []
-    for tid in sorted(per_ticker_features.keys()):
-        all_feature_cols.extend(per_ticker_features[tid])
-
-    extra_cols: List[str] = []
-    if feature_mode == "spreads":
-        combined_df, extra_cols = add_spread_features(combined_df, per_ticker_features)
-        all_feature_cols.extend(extra_cols)
-    elif feature_mode == "relation":
-        combined_df, extra_cols = add_relation_features(combined_df, primary_ticker_id, per_ticker_features)
-        all_feature_cols.extend(extra_cols)
-
-    train_df, val_df, test_df = time_split(combined_df, cfg)
+    # Split into train/val/test
+    train_df, val_df, test_df = time_split_multi(stacked, cfg)
     if train_df.empty or val_df.empty or test_df.empty:
         raise ValueError("Train/Val/Test split produced empty partitions. Check date ranges.")
 
-    train_x = train_df[all_feature_cols].to_numpy(dtype=np.float32)
-    mean, std = zscore_fit(train_x)
+    train_df = train_df.copy()
+    val_df = val_df.copy()
+    test_df = test_df.copy()
+    for split_df in [train_df, val_df, test_df]:
+        split_df[all_feature_cols] = split_df[all_feature_cols].astype(np.float32)
 
-    train_ds = TimeSeriesWindowDataset(train_df, all_feature_cols, cfg.target_col, cfg.seq_len, cfg.ticker_col, cfg.date_col, mean, std, True)
-    val_ds = TimeSeriesWindowDataset(val_df, all_feature_cols, cfg.target_col, cfg.seq_len, cfg.ticker_col, cfg.date_col, mean, std, True)
-    test_ds = TimeSeriesWindowDataset(test_df, all_feature_cols, cfg.target_col, cfg.seq_len, cfg.ticker_col, cfg.date_col, mean, std, True)
+    # Normalize each ticker separately: fit on train, apply to val and test
+    for tid in stacked[cfg.ticker_col].unique():
+        mask_train = train_df[cfg.ticker_col] == tid
+        train_x_tid = train_df.loc[mask_train, all_feature_cols].to_numpy(dtype=np.float32)
+        if len(train_x_tid) == 0:
+            continue
+        mean, std = zscore_fit(train_x_tid)
+        for split_df in [train_df, val_df, test_df]:
+            mask = split_df[cfg.ticker_col] == tid
+            if mask.any():
+                split_df.loc[mask, all_feature_cols] = zscore_transform(
+                    split_df.loc[mask, all_feature_cols].to_numpy(dtype=np.float32), mean, std
+                )
+
+    # Build datasets (scaling already done above, so apply_scaling=False)
+    train_ds = TimeSeriesWindowDataset(train_df, all_feature_cols, cfg.target_col, cfg.seq_len, cfg.ticker_col, cfg.date_col, apply_scaling=False)
+    val_ds = TimeSeriesWindowDataset(val_df, all_feature_cols, cfg.target_col, cfg.seq_len, cfg.ticker_col, cfg.date_col, apply_scaling=False)
+    test_ds = TimeSeriesWindowDataset(test_df, all_feature_cols, cfg.target_col, cfg.seq_len, cfg.ticker_col, cfg.date_col, apply_scaling=False)
 
     return train_ds, val_ds, test_ds, all_feature_cols
-
-
-if __name__ == "__main__":  # pragma: no cover
-    ROOT_DIR = Path(__file__).resolve().parents[1]
-    paths = [ROOT_DIR / "data" / "sp500_dataset.csv"]
-    cfg = SplitConfig(seq_len=60, train_end="2017-12-31", val_end="2021-12-31")
-    train_ds, val_ds, test_ds, feats = load_datasets(paths, cfg)
-    X, y, w = train_ds[0]
-    print("Feature dim D =", X.shape[1])
-    print("X shape =", tuple(X.shape), "y =", y.item(), "w =", w.item())
-    print("Train/Val/Test sizes =", len(train_ds), len(val_ds), len(test_ds))
-    print("First 10 feature cols:", feats[:10])

@@ -14,12 +14,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import average_precision_score
 
+
 from dataset import SplitConfig, load_datasets
+from model import ModelConfig, TimeSeriesTransformerRegressor
 
 ARTIFACTS_DIR = Path("artifacts")
 EVAL_DIR = ARTIFACTS_DIR / "evals"
-from model import ModelConfig, TimeSeriesTransformerRegressor
-
 
 
 def ensure_dir(path: Path) -> None:
@@ -27,12 +27,14 @@ def ensure_dir(path: Path) -> None:
 
 
 def set_seed(seed: int = 42) -> None:
+    # Fix random seeds for reproducible results
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
 
 def collect_probs(model, loader, device, ticker_seq: np.ndarray):
+    """Run the model on a full dataloader and collect probabilities, logits, labels, ticker IDs."""
     model.eval()
     probs: List[torch.Tensor] = []
     logits_all: List[torch.Tensor] = []
@@ -41,7 +43,7 @@ def collect_probs(model, loader, device, ticker_seq: np.ndarray):
     offset = 0
     ticker_seq = np.asarray(ticker_seq)
 
-    for X, y, _ in loader:
+    for X, y in loader:
         X = X.to(device)
         y = y.to(device).float().view(-1, 1)
         logits = model(X)
@@ -62,6 +64,7 @@ def collect_probs(model, loader, device, ticker_seq: np.ndarray):
 
 
 def metrics_from_probs(y: np.ndarray, prob: np.ndarray, thr: float) -> Dict[str, float]:
+    """Compute precision, recall, F1, accuracy from predicted probabilities and a threshold."""
     if len(y) == 0:
         return {
             "acc": float("nan"),
@@ -139,7 +142,7 @@ def select_constrained_best_f1(
             best_row = row
     constrained = True
     if best_row is None:
-        # fall back to the row whose alert rate is closest to the bounds
+        # No row meets the alert rate bounds; pick the closest one
         constrained = False
         best_row = min(
             sweep_rows,
@@ -149,8 +152,23 @@ def select_constrained_best_f1(
 
 
 def threshold_by_alert_rate(prob: np.ndarray, alert_rate: float) -> float:
+    """Set threshold so that exactly `alert_rate` fraction of samples get flagged as alerts."""
     alert_rate = float(np.clip(alert_rate, 1e-6, 1.0 - 1e-6))
     return float(np.quantile(prob, 1.0 - alert_rate))
+
+
+def select_precision_target(
+    sweep_rows: List[Dict[str, float]],
+    min_precision: float,
+) -> Tuple[float, Dict[str, float]]:
+    """Pick the lowest threshold where precision >= min_precision (maximizes recall)."""
+    candidates = [r for r in sweep_rows if r.get("precision", 0.0) >= min_precision and r.get("recall", 0.0) > 0]
+    if not candidates:
+        # No row meets min_precision; fall back to highest precision row
+        best_row = max(sweep_rows, key=lambda r: r.get("precision", 0.0))
+    else:
+        best_row = max(candidates, key=lambda r: r.get("recall", 0.0))
+    return float(best_row["thr"]), best_row
 
 
 def class_stats(prob: np.ndarray, y: np.ndarray) -> Dict[str, Dict[str, float]]:
@@ -176,6 +194,70 @@ def yearly_pred_pos_rate(prob: np.ndarray, thr: float, dates: Optional[np.ndarra
     df["year"] = df["date"].dt.year
     grouped = df.groupby("year")["pred"].mean().to_dict()
     return {str(int(k)): float(v) for k, v in grouped.items()}
+
+
+def yearly_metrics(
+    prob: np.ndarray,
+    y: np.ndarray,
+    thr: float,
+    dates: Optional[np.ndarray],
+) -> Dict[str, Dict[str, float]]:
+    """Compute precision/recall/PR-AUC for each calendar year. Returns {year: metrics}."""
+    if dates is None or len(dates) == 0:
+        return {}
+    df = pd.DataFrame({"prob": prob, "y": y, "date": pd.to_datetime(dates)})
+    df["year"] = df["date"].dt.year
+    result: Dict[str, Dict[str, float]] = {}
+    for yr, grp in df.groupby("year"):
+        m = evaluate_subset(grp["prob"].to_numpy(), grp["y"].to_numpy(), thr)
+        result[str(int(yr))] = m
+    return result
+
+
+# SP500 market regime per year.
+# bear: annual return < -10%. volatile: large swings (e.g. 2020: +16% but -34% crash). bull: > +10%.
+YEAR_REGIME: Dict[int, str] = {
+    2000: "bear", 2001: "bear", 2002: "bear",
+    2003: "bull", 2004: "bull", 2005: "bull", 2006: "bull", 2007: "bull",
+    2008: "bear", 2009: "bull",
+    2010: "bull", 2011: "volatile", 2012: "bull", 2013: "bull",
+    2014: "bull", 2015: "volatile", 2016: "bull", 2017: "bull",
+    2018: "bear", 2019: "bull",
+    2020: "volatile", 2021: "bull", 2022: "bear",
+    2023: "bull", 2024: "bull", 2025: "bull",
+}
+
+
+def print_yearly_regime_table(
+    prob: np.ndarray,
+    y: np.ndarray,
+    thr: float,
+    dates: Optional[np.ndarray],
+    label: str = "TEST",
+) -> Dict[str, Dict[str, float]]:
+    """Print a table of per-year metrics with the market regime label."""
+    ym = yearly_metrics(prob, y, thr, dates)
+    if not ym:
+        return ym
+    print(f"\n[{label}] Per-year metrics (thr={thr:.3f})")
+    print(f"  {'Year':<6} {'Regime':<10} {'Prec':>6} {'Rec':>6} {'F1':>6} {'PR-AUC':>7} {'AlertR':>7} {'N':>5}")
+    for yr_str in sorted(ym.keys()):
+        m = ym[yr_str]
+        yr_int = int(yr_str)
+        regime = YEAR_REGIME.get(yr_int, "?")
+        prec   = m.get("precision", float("nan"))
+        rec    = m.get("recall",    float("nan"))
+        f1     = m.get("f1",        float("nan"))
+        prauc  = m.get("pr_auc",    float("nan"))
+        alert  = m.get("pred_pos_rate", float("nan"))
+        n_pos  = int(round(m.get("positive_rate", 0) * (m["cm"][0][0] + m["cm"][0][1] + m["cm"][1][0] + m["cm"][1][1]))) if "cm" in m else 0
+        total  = m["cm"][0][0] + m["cm"][0][1] + m["cm"][1][0] + m["cm"][1][1] if "cm" in m else 0
+        print(
+            f"  {yr_str:<6} {regime:<10} {prec:6.3f} {rec:6.3f} {f1:6.3f} "
+            f"{prauc:7.3f} {alert:7.3f} {total:5d}"
+        )
+    return ym
+
 
 
 def probability_hist(prob: np.ndarray, bins: np.ndarray) -> List[int]:
@@ -240,7 +322,37 @@ def save_eval_artifacts(run_name: str, summary: Dict[str, object], arrays: Dict[
     np.savez(npz_path, **arrays)
 
 
+def find_temperature(logits: np.ndarray, labels: np.ndarray) -> float:
+    """
+    Find temperature T that minimizes NLL on the validation set.
+    Calibrated probability = sigmoid(logit / T).
+    T > 1 shifts probabilities toward 0.5 (reduces overconfidence).
+    """
+    logits_t = torch.tensor(logits, dtype=torch.float32).unsqueeze(1)
+    labels_t = torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
+    T = nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.LBFGS([T], lr=0.01, max_iter=100)
+
+    def closure():
+        optimizer.zero_grad()
+        loss = nn.functional.binary_cross_entropy_with_logits(logits_t / T.clamp(min=0.1), labels_t)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+    return float(T.item())
+
+
+def apply_temperature(logits: np.ndarray, T: float) -> np.ndarray:
+    return torch.sigmoid(torch.tensor(logits, dtype=torch.float32) / T).numpy()
+
+
 def focal_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, alpha: float, gamma: float) -> torch.Tensor:
+    """
+    Focal Loss: like BCE but down-weights easy examples.
+    gamma=2 means the model focuses more on hard-to-classify samples.
+    alpha balances the positive class weight (~25% positive in our data).
+    """
     bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     probs = torch.sigmoid(logits)
     p_t = targets * probs + (1 - targets) * (1 - probs)
@@ -250,36 +362,40 @@ def focal_loss_with_logits(logits: torch.Tensor, targets: torch.Tensor, alpha: f
 
 
 def train_one_epoch(model, loader, optimizer, loss_fn, device, loss_type: str, focal_alpha: float, focal_gamma: float) -> float:
+    """Run one epoch of training: forward pass, compute loss, backpropagate, update weights."""
     model.train()
     total_loss = 0.0
-    total_weight = 0.0
+    n_batches = 0
 
-    for X, y, w in loader:
+    for X, y in loader:
         X = X.to(device)
         y = y.to(device).float().view(-1, 1)
-        w = w.to(device).float().view(-1, 1)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(X)
         if loss_type == "focal":
-            raw_loss = focal_loss_with_logits(logits, y, focal_alpha, focal_gamma)
+            loss = focal_loss_with_logits(logits, y, focal_alpha, focal_gamma).mean()
         else:
-            raw_loss = loss_fn(logits, y)
-        if raw_loss.dim() > 1:
-            raw_loss = raw_loss.view(-1, 1)
-        weighted_loss = raw_loss * w
-        loss = weighted_loss.sum() / (w.sum() + 1e-8)
+            loss = loss_fn(logits, y).mean()
         loss.backward()
         optimizer.step()
 
-        total_loss += float(weighted_loss.sum().item())
-        total_weight += float(w.sum().item())
+        total_loss += float(loss.item())
+        n_batches += 1
 
-    return total_loss / max(total_weight, 1e-8)
-
+    return total_loss / max(n_batches, 1)
 
 
 def run_training(args) -> Dict[str, float]:
+    """
+    Full training pipeline:
+      1. Load datasets (SP500 + QQQ + DJI)
+      2. Build Transformer model
+      3. Train with Focal Loss + AdamW, save best checkpoint by val PR-AUC
+      4. Load best checkpoint, apply temperature scaling to calibrate probabilities
+      5. Choose alert threshold using the selected threshold policy
+      6. Print and save final metrics
+    """
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device)
@@ -294,9 +410,8 @@ def run_training(args) -> Dict[str, float]:
     train_ds, val_ds, test_ds, feature_cols = load_datasets(
         dataset_paths,
         split_cfg,
-        primary_ticker_id=primary_id,
         label_mode=args.label_mode,
-        feature_mode=args.feature_mode,
+        feature_stage=args.feature_stage,
     )
     current_ts = datetime.now(timezone.utc)
     run_name = args.run_name or f"run_{current_ts.strftime('%Y%m%d_%H%M%S')}"
@@ -435,6 +550,23 @@ def run_training(args) -> Dict[str, float]:
     val_pos_ratio = float(val_y_primary.mean())
     test_pos_ratio = float(test_y_primary.mean())
 
+    # Temperature scaling: calibrate probabilities on the validation set.
+    # This finds a scalar T so that sigmoid(logit/T) is better calibrated.
+    # T > 1 softens overconfident predictions toward 0.5.
+    ece_before = reliability_table(val_prob_primary, val_y_primary)["ece"]
+    temperature = find_temperature(val_logit_primary, val_y_primary)
+    val_prob_primary = apply_temperature(val_logit_primary, temperature)
+    test_prob_primary = apply_temperature(test_logit_primary, temperature)
+    val_prob = apply_temperature(val_logit, temperature)
+    test_prob = apply_temperature(test_logit, temperature)
+    ece_after = reliability_table(val_prob_primary, val_y_primary)["ece"]
+    print(f"[Temperature Scaling] T={temperature:.4f} | VAL ECE: {ece_before:.3f} -> {ece_after:.3f}")
+
+    # Save temperature into checkpoint so inference uses the same calibration
+    ckpt_data = torch.load(ckpt_path, map_location=device)
+    ckpt_data["temperature"] = temperature
+    torch.save(ckpt_data, ckpt_path)
+
     thresholds = np.linspace(0.01, 0.99, 99)
     sweep = threshold_sweep(val_prob_primary, val_y_primary, thresholds)
     best_thr = sweep["best_threshold"]
@@ -442,6 +574,11 @@ def run_training(args) -> Dict[str, float]:
         sweep["rows"], args.min_alert_rate, args.max_alert_rate
     )
 
+    # Choose the alert threshold using the selected policy:
+    #   "precision_target" : lowest threshold where val precision >= min_precision (maximizes recall)
+    #   "constrained_f1"   : best F1 within allowed alert rate range
+    #   "derived_alert"    : alert_rate = val_positive_rate * multiplier
+    #   "fixed_alert"      : use the exact --alert_rate value
     derived_alert_rate: Optional[float] = None
     alert_rate_used: Optional[float] = None
     if args.threshold_policy == "derived_alert":
@@ -452,6 +589,9 @@ def run_training(args) -> Dict[str, float]:
     elif args.threshold_policy == "constrained_f1":
         thr_primary = best_thr_constrained
         alert_rate_used = float(constrained_row.get("pred_pos_rate", float("nan")))
+    elif args.threshold_policy == "precision_target":
+        thr_primary, pt_row = select_precision_target(sweep["rows"], args.min_precision)
+        alert_rate_used = float(pt_row.get("pred_pos_rate", float("nan")))
     else:
         base_rate = float(args.alert_rate)
         alert_rate_used = float(np.clip(base_rate, args.min_alert_rate, args.max_alert_rate))
@@ -477,6 +617,10 @@ def run_training(args) -> Dict[str, float]:
     print("TEST primary:", format_metrics("SP500", test_primary_metrics))
     print("TEST pooled:", format_metrics("All", test_pooled_metrics))
 
+    # Per-year breakdown by market regime
+    print_yearly_regime_table(val_prob_primary,  val_y_primary,  thr_primary, val_dates_primary,  label="VAL")
+    print_yearly_regime_table(test_prob_primary, test_y_primary, thr_primary, test_dates_primary, label="TEST")
+
     val_best_metrics = evaluate_subset(val_prob_primary, val_y_primary, best_thr)
     test_best_metrics = evaluate_subset(test_prob_primary, test_y_primary, best_thr)
 
@@ -498,6 +642,9 @@ def run_training(args) -> Dict[str, float]:
     print(f"    bins={hist_bins.tolist()} counts={test_hist}")
     print("[Diagnostics] Class stats (VAL)", val_class)
     print("[Diagnostics] Class stats (TEST)", test_class)
+    val_gap  = val_class.get("1", {}).get("mean", float("nan"))  - val_class.get("0", {}).get("mean", float("nan"))
+    test_gap = test_class.get("1", {}).get("mean", float("nan")) - test_class.get("0", {}).get("mean", float("nan"))
+    print(f"[Diagnostics] Class mean gap => VAL: {val_gap:.4f}  TEST: {test_gap:.4f}  (target >0.15)")
     print(f"[Diagnostics] Reliability (VAL) ECE={val_rel['ece']:.3f}")
     for row in val_rel["table"]:
         print("    ", row)
@@ -518,6 +665,9 @@ def run_training(args) -> Dict[str, float]:
         alert_rate_used_value = float(alert_rate_used)
 
     summary = {
+        "temperature": float(temperature),
+        "ece_before_calibration": float(ece_before),
+        "ece_after_calibration": float(ece_after),
         "feature_dim": D,
         "train_counts": train_counts,
         "val_counts": val_counts,
@@ -582,41 +732,41 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--datasets", type=str,
                         default="data/sp500_dataset.csv,data/qqq_dataset.csv,data/dji_dataset.csv")
-    parser.add_argument("--seq_len", type=int, default=60)
+    parser.add_argument("--seq_len", type=int, default=10)
     parser.add_argument("--train_end", type=str, default="2017-12-31")
     parser.add_argument("--val_end", type=str, default="2021-12-31")
     parser.add_argument("--primary_ticker_id", type=int, default=0)
     parser.add_argument("--label_mode", type=str, default="baseline",
                         choices=["baseline", "event_day_only", "event_day_plus_prev1"],
-                        help="Label shaping strategy for primary ticker")
-    parser.add_argument("--feature_mode", type=str, default="baseline",
-                        choices=["baseline", "spreads", "relation"],
-                        help="Optional feature augmentation mode")
+                        help="Label shaping strategy")
+    parser.add_argument("--feature_stage", type=int, default=None,
+                        help="Ablation stage (0-4). None = all features in CSV")
 
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--loss_type", type=str, default="bce", choices=["bce", "focal"],
+    parser.add_argument("--loss_type", type=str, default="focal", choices=["bce", "focal"],
                         help="Loss function: weighted BCE or focal")
     parser.add_argument("--focal_gamma", type=float, default=2.0)
     parser.add_argument("--focal_alpha", type=float, default=0.0,
                         help="Set >0 to override automatic focal alpha (pos-class weight)")
 
-    parser.add_argument("--d_model", type=int, default=64)
+    parser.add_argument("--d_model", type=int, default=28)
     parser.add_argument("--nhead", type=int, default=4)
-    parser.add_argument("--num_layers", type=int, default=3)
-    parser.add_argument("--dim_ff", type=int, default=128)
+    parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--dim_ff", type=int, default=32)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--pooling", type=str, default="last", choices=["last", "mean"])
 
-    parser.add_argument("--threshold_policy", type=str, default="fixed_alert",
-                        choices=["fixed_alert", "derived_alert", "constrained_f1"],
+    parser.add_argument("--threshold_policy", type=str, default="precision_target",
+                        choices=["fixed_alert", "derived_alert", "constrained_f1", "precision_target"],
                         help="Threshold selection strategy")
+    parser.add_argument("--min_precision", type=float, default=0.45,
+                        help="Minimum precision required (used by precision_target policy)")
     parser.add_argument("--min_alert_rate", type=float, default=0.05,
                         help="Lower bound for acceptable alert rate")
     parser.add_argument("--max_alert_rate", type=float, default=0.20,
